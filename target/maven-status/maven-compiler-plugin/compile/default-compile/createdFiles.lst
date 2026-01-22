@@ -1,0 +1,13 @@
+com\reverseaz\auth\EncryptionUtil.class
+com\reverseaz\auth\MojangAuth.class
+com\reverseaz\packet\CompressionHandler.class
+com\reverseaz\ProxySession.class
+com\reverseaz\packet\CompressionHandler$CompressionResult.class
+com\reverseaz\auth\CipherStreams$EncryptingOutputStream.class
+com\reverseaz\auth\CipherStreams.class
+com\reverseaz\ProxySession$PacketData.class
+com\reverseaz\auth\CipherStreams$DecryptingInputStream.class
+com\reverseaz\MinecraftProxy.class
+com\reverseaz\packet\PacketBuffer.class
+com\reverseaz\packet\PacketHandler.class
+com\reverseaz\VelocityModifier.class
