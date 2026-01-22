@@ -69,11 +69,13 @@ public class ProxySession {
             serverSocket.setReceiveBufferSize(BUFFER_SIZE);
             serverSocket.setSendBufferSize(BUFFER_SIZE);
 
-            // Streams initiaux (non chiffrés)
-            serverIn = new BufferedInputStream(serverSocket.getInputStream(), BUFFER_SIZE);
-            serverOut = new BufferedOutputStream(serverSocket.getOutputStream(), BUFFER_SIZE);
-            clientIn = new BufferedInputStream(clientSocket.getInputStream(), BUFFER_SIZE);
-            clientOut = new BufferedOutputStream(clientSocket.getOutputStream(), BUFFER_SIZE);
+            // Streams initiaux NON bufferisés pour la phase de login
+            // On n'utilise PAS de BufferedInputStream ici car il lit à l'avance (buffer)
+            // et quand on switch vers les streams chiffrés, ces bytes seraient perdus
+            serverIn = serverSocket.getInputStream();
+            serverOut = serverSocket.getOutputStream();
+            clientIn = clientSocket.getInputStream();
+            clientOut = clientSocket.getOutputStream();
 
             // Phase Login avec gestion encryption
             handleLoginPhase();
@@ -83,6 +85,17 @@ public class ProxySession {
 
             // Si play state, lancer relay normal
             if (connectionState == 3) {
+                System.out.println("[*] Play state - démarrage du relay...");
+
+                // Maintenant on peut ajouter les buffers pour le mode play
+                // (si pas déjà fait par l'encryption handler)
+                if (!serverEncrypted) {
+                    serverIn = new BufferedInputStream(serverIn, BUFFER_SIZE);
+                    serverOut = new BufferedOutputStream(serverOut, BUFFER_SIZE);
+                }
+                clientIn = new BufferedInputStream(clientIn, BUFFER_SIZE);
+                clientOut = new BufferedOutputStream(clientOut, BUFFER_SIZE);
+
                 Thread clientToServer = new Thread(() -> relayClientToServer(), "C2S");
                 Thread serverToClient = new Thread(() -> relayServerToClient(), "S2C");
 
@@ -255,8 +268,19 @@ public class ProxySession {
         System.out.println("[P->S] Encryption Response envoyée");
 
         // Activer l'encryption sur la connexion serveur
-        serverIn = new CipherStreams.DecryptingInputStream(serverSocket.getInputStream(), sharedSecret);
-        serverOut = new CipherStreams.EncryptingOutputStream(serverSocket.getOutputStream(), sharedSecret);
+        // IMPORTANT: On doit créer les cipher streams à partir des streams socket bruts
+        // car l'encryption doit s'appliquer à TOUS les bytes, pas aux buffers existants
+        // On flush d'abord le serverOut bufferisé pour s'assurer que tout est envoyé
+        serverOut.flush();
+
+        // Créer les streams chiffrés - ils wrappent directement le socket
+        InputStream rawServerIn = serverSocket.getInputStream();
+        OutputStream rawServerOut = serverSocket.getOutputStream();
+
+        serverIn = new BufferedInputStream(
+                new CipherStreams.DecryptingInputStream(rawServerIn, sharedSecret), BUFFER_SIZE);
+        serverOut = new BufferedOutputStream(
+                new CipherStreams.EncryptingOutputStream(rawServerOut, sharedSecret), BUFFER_SIZE);
         serverEncrypted = true;
         System.out.println("[*] Encryption activée avec le serveur!");
 
@@ -264,14 +288,45 @@ public class ProxySession {
     }
 
     /**
-     * Relay Client -> Serveur en mode brut (bytes)
+     * Relay Client -> Serveur avec reformatage des paquets
+     * Le client envoie en format non compressé: [Length][PacketID][Data]
+     * Le serveur attend le format compressé: [Length][DataLength][PacketID][Data]
      */
     private void relayClientToServer() {
         try {
-            byte[] buffer = new byte[BUFFER_SIZE];
-            int bytesRead;
-            while (running.get() && (bytesRead = clientIn.read(buffer)) != -1) {
-                serverOut.write(buffer, 0, bytesRead);
+            while (running.get()) {
+                // Lire la taille du paquet client (format non compressé)
+                int packetLength = readVarInt(clientIn);
+                if (packetLength < 0)
+                    break;
+
+                // Lire le contenu du paquet
+                byte[] packetData = new byte[packetLength];
+                int totalRead = 0;
+                while (totalRead < packetLength) {
+                    int read = clientIn.read(packetData, totalRead, packetLength - totalRead);
+                    if (read == -1)
+                        break;
+                    totalRead += read;
+                }
+                if (totalRead < packetLength)
+                    break;
+
+                // Reformater pour le serveur (ajouter le format compression)
+                if (compressionThreshold >= 0) {
+                    // Format: [TotalLength][DataLength=0][PacketData]
+                    // DataLength=0 signifie "pas compressé"
+                    int dataLengthSize = PacketBuffer.getVarIntSize(0);
+                    int totalLength = dataLengthSize + packetLength;
+
+                    writeVarIntTo(serverOut, totalLength);
+                    writeVarIntTo(serverOut, 0); // DataLength = 0 (non compressé)
+                    serverOut.write(packetData);
+                } else {
+                    // Pas de compression, envoyer tel quel
+                    writeVarIntTo(serverOut, packetLength);
+                    serverOut.write(packetData);
+                }
                 serverOut.flush();
             }
         } catch (Exception e) {
