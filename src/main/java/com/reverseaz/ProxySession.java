@@ -356,7 +356,12 @@ public class ProxySession {
             // Modifier la vélocité si c'est un paquet 0x3E
             byte[] modified = modifyVelocityIfNeeded(uncompressedContent);
 
-            // Retourner directement (le client attend [ID][Payload] sans compression)
+            // DEBUG: Log packet sizes
+            if (compressionThreshold >= 0) {
+                System.out.println("Processing: Raw=" + rawPacket.length + " Uncompressed=" + uncompressedContent.length
+                        + " Final=" + modified.length);
+            }
+
             return modified;
 
         } catch (Exception e) {
@@ -613,7 +618,10 @@ public class ProxySession {
         inflater.setInput(data);
         byte[] result = new byte[uncompressedLength];
         try {
-            inflater.inflate(result);
+            int count = inflater.inflate(result);
+            if (count != uncompressedLength) {
+                System.out.println("[!] Decompression mismatch: expected " + uncompressedLength + " got " + count);
+            }
         } catch (java.util.zip.DataFormatException e) {
             throw new IOException("Decompression failed", e);
         }
