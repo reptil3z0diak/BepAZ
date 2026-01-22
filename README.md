@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/Premium-Supported-gold?style=for-the-badge" alt="Premium Support"/>
 </p>
 
-<h1 align="center">⚡ ReverseAZ</h1>
+<h1 align="center">⚡ BepAZ</h1>
 
 <p align="center">
   <b>Minecraft 1.9.4 MITM Proxy — Intercepte et modifie le knockback en temps réel</b><br>
