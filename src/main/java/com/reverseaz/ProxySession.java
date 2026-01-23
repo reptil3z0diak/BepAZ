@@ -264,14 +264,54 @@ public class ProxySession {
     }
 
     /**
-     * Relay Client -> Serveur en mode brut (bytes)
+     * Relay Client -> Serveur avec compression si nécessaire
+     * Le client envoie en non compressé, le serveur attend compressé après Set
+     * Compression
      */
     private void relayClientToServer() {
         try {
-            byte[] buffer = new byte[BUFFER_SIZE];
-            int bytesRead;
-            while (running.get() && (bytesRead = clientIn.read(buffer)) != -1) {
-                serverOut.write(buffer, 0, bytesRead);
+            while (running.get()) {
+                // Lire la taille du paquet (VarInt)
+                int packetLength = readVarInt(clientIn);
+                if (packetLength < 0)
+                    break;
+
+                // Lire le contenu du paquet
+                byte[] packetData = new byte[packetLength];
+                int totalRead = 0;
+                while (totalRead < packetLength) {
+                    int read = clientIn.read(packetData, totalRead, packetLength - totalRead);
+                    if (read == -1)
+                        break;
+                    totalRead += read;
+                }
+                if (totalRead < packetLength)
+                    break;
+
+                // Envoyer au serveur avec compression si activée
+                if (compressionThreshold >= 0) {
+                    // Format compressé: [PacketLength][DataLength][Data]
+                    if (packetData.length >= compressionThreshold) {
+                        // Compresser
+                        byte[] compressed = compress(packetData);
+                        PacketBuffer out = new PacketBuffer(compressed.length + 10);
+                        out.writeVarInt(PacketBuffer.getVarIntSize(packetData.length) + compressed.length);
+                        out.writeVarInt(packetData.length);
+                        out.writeBytes(compressed, 0, compressed.length);
+                        serverOut.write(out.getData(), 0, out.getWriterIndex());
+                    } else {
+                        // Pas de compression mais format compressé (DataLength = 0)
+                        PacketBuffer out = new PacketBuffer(packetData.length + 10);
+                        out.writeVarInt(packetData.length + 1); // +1 pour le VarInt(0)
+                        out.writeVarInt(0); // Non compressé
+                        out.writeBytes(packetData, 0, packetData.length);
+                        serverOut.write(out.getData(), 0, out.getWriterIndex());
+                    }
+                } else {
+                    // Mode non compressé - envoyer tel quel
+                    writeVarIntTo(serverOut, packetData.length);
+                    serverOut.write(packetData);
+                }
                 serverOut.flush();
             }
         } catch (Exception e) {
@@ -353,16 +393,8 @@ public class ProxySession {
                 }
             }
 
-            // Modifier la vélocité si c'est un paquet 0x3E
-            byte[] modified = modifyVelocityIfNeeded(uncompressedContent);
-
-            // DEBUG: Log packet sizes
-            if (compressionThreshold >= 0) {
-                System.out.println("Processing: Raw=" + rawPacket.length + " Uncompressed=" + uncompressedContent.length
-                        + " Final=" + modified.length);
-            }
-
-            return modified;
+            // Modifier la vélocité si les multiplicateurs KB sont actifs
+            return modifyVelocityIfNeeded(uncompressedContent);
 
         } catch (Exception e) {
             // En cas d'erreur, tenter de décompresser et retourner brut
@@ -384,50 +416,71 @@ public class ProxySession {
     }
 
     /**
-     * Modifie le paquet Entity Velocity (0x3E) si c'est le bon type
+     * Modifie le paquet Entity Velocity (0x3E) si les multiplicateurs sont actifs
+     * Modifie en place les valeurs de vélocité pour préserver la structure du
+     * paquet
+     * 
+     * Entity Velocity format (protocol 110):
+     * - VarInt: Packet ID (0x3E)
+     * - VarInt: Entity ID
+     * - Short: Velocity X
+     * - Short: Velocity Y
+     * - Short: Velocity Z
      */
     private byte[] modifyVelocityIfNeeded(byte[] packet) {
-        if (packet.length < 1)
+        // Ne rien faire si pas de modification nécessaire
+        if (velocityModifier.getMultiplierX() == 1.0 &&
+                velocityModifier.getMultiplierY() == 1.0 &&
+                velocityModifier.getMultiplierZ() == 1.0) {
             return packet;
+        }
 
-        PacketBuffer buf = new PacketBuffer(packet.length);
-        buf.writeBytes(packet, 0, packet.length);
-        buf.setReaderIndex(0);
-
-        int packetId = buf.readVarInt();
-
-        // 0x3E = Entity Velocity en 1.9.4
-        if (packetId != 0x3E)
+        // Taille minimale: 1 (packetId) + 1 (entityId min) + 6 (3 shorts) = 8 bytes
+        if (packet.length < 8)
             return packet;
-        if (buf.readableBytes() < 8)
-            return packet; // VarInt + 3 shorts
 
         try {
-            int entityId = buf.readVarInt();
-            short velX = buf.readShort();
-            short velY = buf.readShort();
-            short velZ = buf.readShort();
+            // Vérifier rapidement le premier byte - 0x3B = 59 < 128, donc 1 byte VarInt
+            if ((packet[0] & 0xFF) != 0x3B)
+                return packet;
+
+            // Calculer la taille du VarInt entityId
+            int entityIdStart = 1; // Après le packetId (1 byte pour 0x3E)
+            int entityIdSize = 0;
+            for (int i = entityIdStart; i < packet.length && i < entityIdStart + 5; i++) {
+                entityIdSize++;
+                if ((packet[i] & 0x80) == 0)
+                    break; // Dernier byte du VarInt
+            }
+
+            int velocityStart = entityIdStart + entityIdSize;
+
+            // Vérifier que le paquet a EXACTEMENT la bonne taille
+            // velocityStart + 6 bytes pour les 3 shorts = taille totale
+            if (packet.length != velocityStart + 6)
+                return packet;
+
+            // Lire les vélocités actuelles
+            short velX = (short) (((packet[velocityStart] & 0xFF) << 8) | (packet[velocityStart + 1] & 0xFF));
+            short velY = (short) (((packet[velocityStart + 2] & 0xFF) << 8) | (packet[velocityStart + 3] & 0xFF));
+            short velZ = (short) (((packet[velocityStart + 4] & 0xFF) << 8) | (packet[velocityStart + 5] & 0xFF));
 
             // Appliquer les multiplicateurs
             short[] modified = velocityModifier.modifyVelocity(velX, velY, velZ);
 
-            // Log si modification active
-            if (velocityModifier.getMultiplierX() != 1.0 ||
-                    velocityModifier.getMultiplierY() != 1.0 ||
-                    velocityModifier.getMultiplierZ() != 1.0) {
-                System.out.println("[KB] Velocity: (" + velX + "," + velY + "," + velZ +
-                        ") -> (" + modified[0] + "," + modified[1] + "," + modified[2] + ")");
-            }
+            System.out.println("[KB] Entity Velocity: (" + velX + "," + velY + "," + velZ +
+                    ") -> (" + modified[0] + "," + modified[1] + "," + modified[2] + ")");
 
-            // Reconstruire le paquet
-            PacketBuffer out = new PacketBuffer(packet.length);
-            out.writeVarInt(packetId);
-            out.writeVarInt(entityId);
-            out.writeShort(modified[0]);
-            out.writeShort(modified[1]);
-            out.writeShort(modified[2]);
+            // Modifier en place
+            byte[] result = packet.clone();
+            result[velocityStart] = (byte) ((modified[0] >> 8) & 0xFF);
+            result[velocityStart + 1] = (byte) (modified[0] & 0xFF);
+            result[velocityStart + 2] = (byte) ((modified[1] >> 8) & 0xFF);
+            result[velocityStart + 3] = (byte) (modified[1] & 0xFF);
+            result[velocityStart + 4] = (byte) ((modified[2] >> 8) & 0xFF);
+            result[velocityStart + 5] = (byte) (modified[2] & 0xFF);
 
-            return out.toArray();
+            return result;
         } catch (Exception e) {
             return packet;
         }
